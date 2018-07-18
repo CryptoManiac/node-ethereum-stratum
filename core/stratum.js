@@ -1,7 +1,10 @@
 'use strict';
 
 const port = 3333;
-const diff = 0.0001;
+
+const maxStratumDiff = 10000;
+const minStratumDiff = 0.0001;
+const defaultStratumDiff = 1.0;
 
 const net = require('net');
 const cluster = require('cluster');
@@ -104,13 +107,7 @@ function handleMinerData(method, params, socket, sendReply, pushMessage, process
         break;
 
         case 'mining.authorize':
-            let login, password;
-            [login, password] = params;
-            [socket.minerData.userName, socket.minerData.workerName] = login.split('.');
-            console.log('Miner authorized: ' + login);
-            sendReply(null, true);
-            pushMessage('mining.set_difficulty', [socket.minerData.clientDiff]);
-            sendJob();
+            processAuth(params);
         break;
 
         case 'mining.submit':
@@ -122,7 +119,7 @@ function handleMinerData(method, params, socket, sendReply, pushMessage, process
     }
 }
 
-function StratumServer(port, diff) {
+function StratumServer(port, defaultDiff, minDiff, maxDiff) {
 
     let prepareJob = function() {
         let topJob = server.jobData[server.jobData.length - 1];
@@ -193,20 +190,34 @@ function StratumServer(port, diff) {
         };
 
         let processAuth = function(params) {
+            let [login, password] = params;
+            [socket.minerData.userName, socket.minerData.workerName] = login.split('.');
+            let difficulty = parseFloat(password);
+            if (!isNaN(difficulty) && difficulty >= minDiff && difficulty <= maxDiff) {
+                socket.minerData.clientDiff = difficulty;
+            }
+            console.log('Miner authorized: ' + login);
+            socket.minerData.authorized = true;
             sendReply(null, true);
+            pushMessage('mining.set_difficulty', [socket.minerData.clientDiff]);
+            sendJob();
         };
 
         let processJob = function(params) {
             let job = findJob(params[1]);
             if (!job) return sendReply('Job not found', null);
             let workNonce = socket.minerData.extraNonce + params[2];
-            let r = getHash(job.blockHeight, job.powHash, workNonce);
+            let clientTargetN = diffToTarget(socket.minerData.clientDiff);
 
+            let r = getHash(job.blockHeight, job.powHash, workNonce);
             let hashN = BigInt('0x' + r.result);
-            let isShare = server.shareTarget >= hashN;
+            let isShare = clientTargetN >= hashN;
             let isBlock = isShare && job.blockTarget >= hashN;
 
             if (!isShare) return sendReply('High hash', null);
+
+            // Update activity
+            socket.minerData.lastActivity = new Date();
 
             // Send work data to master process
             process.send({
@@ -214,16 +225,19 @@ function StratumServer(port, diff) {
                 senderId : process.pid,
                 kind : isBlock ? 'candidate' : 'share',
                 jobId : params[1],
-                creatorId : params[0],
+                creatorId : socket.minerData.userName,
+                creatorUnit : socket.minerData.workerName,
                 creatorIp : socket.remoteAddress,
                 height : job.blockHeight,
                 blockTarget : "0x" + job.blockTarget.toString(16),
-                shareTarget : "0x" + server.shareTarget.toString(16),
+                shareTarget : "0x" + clientTargetN.toString(16),
                 nonce : "0x" + workNonce,
                 mixHash : "0x" + r.mix_hash,
                 powHash : "0x" + job.powHash,
                 result : "0x" + r.result
             });
+
+            sendReply(null, true);
         };
 
         handleMinerData(jsonData.method, jsonData.params, socket, sendReply, pushMessage, processAuth, sendJob, processJob);
@@ -236,11 +250,10 @@ function StratumServer(port, diff) {
         let extraNonce = this.getExtraNonce();
         socket.minerData = {
             extraNonce : extraNonce,
-            diff : diff,
+            clientDiff : defaultDiff,
             authorized : false,
-            username: '',
+            userName : '',
             workerName : '',
-            workerPassword : '',
             lastActivity : 0
         };
         this.activeMiners[extraNonce] = socket;
@@ -303,7 +316,6 @@ function StratumServer(port, diff) {
 
     server.activeMiners = [];
     server.jobData = [null];
-    server.shareTarget = diffToTarget(diff);
 
     server.getExtraNonce = function() {
         while (42) {
@@ -331,7 +343,6 @@ function StratumServer(port, diff) {
         server.jobData = data;
         updateStates(topJob.blockHeight);
         broadcastJob();
-        console.log(new Date().toString() + ': New block #' + topJob.jobId + ' to mine at height ' + topJob.blockHeight + ' from ' + topJob.endpoint);
     };
 
     server.listen(port, error => {
@@ -359,6 +370,10 @@ if (cluster.isMaster) {
     }
 
     process.on('message', async msg => {
+        // Display job info
+        let topJob = msg.data[msg.data.length - 1];
+        console.log(new Date().toString() + ': New block #' + topJob.jobId + ' to mine at height ' + topJob.blockHeight + ' from ' + topJob.endpoint);
+
         // Forward any message received by master to worker processes
         for (let i in workers) {
             workers[i].send(msg);
@@ -371,7 +386,7 @@ if (cluster.isMaster) {
 }
 
 if (cluster.isWorker) {
-    let s = StratumServer(port, diff);
+    let s = StratumServer(port, defaultStratumDiff, minStratumDiff, maxStratumDiff);
     process.on('message', async msg => {
         if (msg.sender && msg.sender == 'upstream') {
             s.setJob(msg.data);
